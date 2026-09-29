@@ -13,7 +13,7 @@ mkdir -p "${CONFIG_DIR}" /etc/caddy
 # Runtime ports
 # -----------------------------
 WEB_PORT="${PORT:-8080}"
-REALITY_PORT="${REALITY_PORT:-2053}"
+REALITY_PORT="${REALITY_PORT:-${RAILWAY_TCP_APPLICATION_PORT:-2053}}"
 XHTTP_PORT="${XHTTP_BACKEND_PORT:-10001}"
 GRPC_PORT="${GRPC_BACKEND_PORT:-10002}"
 
@@ -45,7 +45,6 @@ PRIVATE_KEY="$(printf '%s\n' "${REALITY_KEYS}" |
 
 if [ -z "${PRIVATE_KEY}" ]; then
     echo "ERROR: failed to parse Reality private key."
-    echo "${REALITY_KEYS}" >&2
     exit 1
 fi
 
@@ -56,7 +55,6 @@ PUBLIC_KEY="$(printf '%s\n' "${PUBLIC_KEY_OUTPUT}" |
 
 if [ -z "${PUBLIC_KEY}" ]; then
     echo "ERROR: failed to derive Reality public key."
-    echo "${PUBLIC_KEY_OUTPUT}" >&2
     exit 1
 fi
 
@@ -137,12 +135,10 @@ bootstrap_railway() {
         TCP_COUNT="$(printf '%s' "${TCP_RESPONSE}" | jq '.data.tcpProxies | length')"
 
         if [ "${TCP_COUNT}" -gt 0 ]; then
-            EXISTING="$(printf '%s' "${TCP_RESPONSE}" | jq -r '.data.tcpProxies[0] | "\(.domain):\(.proxyPort) -> :\(.applicationPort)"')"
-            echo "ERROR: this Railway service already has a TCP Proxy: ${EXISTING}" >&2
-            echo "Railway currently allows only one TCP Proxy per service." >&2
-            echo "Remove the old TCP Proxy in Railway and redeploy to let this project create :${REALITY_PORT}." >&2
-            exit 1
-        fi
+            TCP_PROXY_MATCH="$(printf '%s' "${TCP_RESPONSE}" | jq -c '.data.tcpProxies[0]')"
+            REALITY_PORT="$(printf '%s' "${TCP_PROXY_MATCH}" | jq -r '.applicationPort')"
+            echo "Reusing existing Railway TCP Proxy on :${REALITY_PORT}."
+        else
 
         CREATE_TCP='mutation($input:TCPProxyCreateInput!){tcpProxyCreate(input:$input){id domain proxyPort applicationPort}}'
         CREATE_TCP_VARS="$(jq -cn             --arg serviceId "${SERVICE_ID}"             --arg environmentId "${ENVIRONMENT_ID}"             --argjson applicationPort "${REALITY_PORT}"             '{input:{serviceId:$serviceId,environmentId:$environmentId,applicationPort:$applicationPort}}')"
