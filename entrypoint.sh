@@ -39,11 +39,24 @@ fi
 SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 4 | tr -d '\r\n ')}"
 
 REALITY_KEYS="$("${XRAY_BIN}" x25519 2>&1)"
-PRIVATE_KEY="$(printf '%s\n' "${REALITY_KEYS}" | awk -F ': ' 'tolower($0) ~ /private key/ {print $2; exit}' | tr -d '\r\n ')"
-PUBLIC_KEY="$(printf '%s\n' "${REALITY_KEYS}" | awk -F ': ' 'tolower($0) ~ /public key|password/ {print $2; exit}' | tr -d '\r\n ')"
+PRIVATE_KEY="$(printf '%s\n' "${REALITY_KEYS}" |
+    awk -F ': ' 'tolower($1) == "privatekey" || tolower($1) == "private key" {print $2; exit}' |
+    tr -d '\r\n ')"
 
-if [ -z "${PRIVATE_KEY}" ] || [ -z "${PUBLIC_KEY}" ]; then
-    echo "ERROR: failed to generate Reality key pair."
+if [ -z "${PRIVATE_KEY}" ]; then
+    echo "ERROR: failed to parse Reality private key."
+    echo "${REALITY_KEYS}" >&2
+    exit 1
+fi
+
+PUBLIC_KEY_OUTPUT="$("${XRAY_BIN}" x25519 -i "${PRIVATE_KEY}" 2>&1)"
+PUBLIC_KEY="$(printf '%s\n' "${PUBLIC_KEY_OUTPUT}" |
+    awk -F ': ' 'tolower($1) == "password" || tolower($1) == "public key" {print $2; exit}' |
+    tr -d '\r\n ')"
+
+if [ -z "${PUBLIC_KEY}" ]; then
+    echo "ERROR: failed to derive Reality public key."
+    echo "${PUBLIC_KEY_OUTPUT}" >&2
     exit 1
 fi
 
@@ -89,27 +102,28 @@ bootstrap_railway() {
     DOMAIN_TARGET_PORT="$(printf '%s' "${DOMAIN_RESPONSE}" | jq -r '.data.domains.serviceDomains[0].targetPort // empty')"
 
     if [ -z "${SERVICE_DOMAIN}" ]; then
-        CREATE_DOMAIN='mutation($input:ServiceDomainCreateInput!){serviceDomainCreate(input:$input){id domain targetPort}}'
-        CREATE_DOMAIN_VARS="$(jq -cn             --arg serviceId "${SERVICE_ID}"             --arg environmentId "${ENVIRONMENT_ID}"             '{input:{serviceId:$serviceId,environmentId:$environmentId}}')"
+    if [ -z "${SERVICE_DOMAIN}" ]; then
+        CREATE_DOMAIN='mutation($serviceId:String!,$environmentId:String!){serviceDomainCreate(serviceId:$serviceId,environmentId:$environmentId){id domain}}'
+        CREATE_DOMAIN_VARS="$(jq -cn \
+            --arg serviceId "${SERVICE_ID}" \
+            --arg environmentId "${ENVIRONMENT_ID}" \
+            '{serviceId:$serviceId,environmentId:$environmentId}')"
 
         CREATE_DOMAIN_RESPONSE="$(railway_post "${CREATE_DOMAIN}" "${CREATE_DOMAIN_VARS}")"
-        SERVICE_DOMAIN="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.domain')"
-        SERVICE_DOMAIN_ID="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.id')"
-        DOMAIN_TARGET_PORT="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.targetPort // empty')"
+        SERVICE_DOMAIN="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.domain // empty')"
+        SERVICE_DOMAIN_ID="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.id // empty')"
+
+        if [ -z "${SERVICE_DOMAIN}" ]; then
+            echo "ERROR: Railway Service Domain was not created." >&2
+            printf '%s\n' "${CREATE_DOMAIN_RESPONSE}" | jq -c '.errors // .'
+            exit 1
+        fi
 
         echo "Created Railway service domain: ${SERVICE_DOMAIN}"
     fi
 
-    # Ensure the Railway-provided HTTPS domain points at the HTTP port
-    # where Caddy listens. This keeps public traffic on :443.
-    if [ -n "${SERVICE_DOMAIN_ID}" ] && [ "${DOMAIN_TARGET_PORT:-}" != "${WEB_PORT}" ]; then
-        UPDATE_DOMAIN='mutation($input:ServiceDomainUpdateInput!){serviceDomainUpdate(input:$input){id domain targetPort}}'
-        UPDATE_DOMAIN_VARS="$(jq -cn             --arg serviceId "${SERVICE_ID}"             --arg environmentId "${ENVIRONMENT_ID}"             --arg domainId "${SERVICE_DOMAIN_ID}"             --arg domain "${SERVICE_DOMAIN}"             --argjson targetPort "${WEB_PORT}"             '{input:{serviceId:$serviceId,environmentId:$environmentId,serviceDomainId:$domainId,domain:$domain,targetPort:$targetPort}}')"
-
-        railway_post "${UPDATE_DOMAIN}" "${UPDATE_DOMAIN_VARS}" >/dev/null
-        echo "Updated Railway service domain target port to ${WEB_PORT}."
-    fi
-
+    # Railway maps the Service Domain to the service's detected PORT.
+    # No serviceDomainUpdate is required.
     TCP_QUERY='query($environmentId:String!,$serviceId:String!){tcpProxies(environmentId:$environmentId,serviceId:$serviceId){id domain proxyPort applicationPort}}'
     TCP_VARS="$(jq -cn         --arg environmentId "${ENVIRONMENT_ID}"         --arg serviceId "${SERVICE_ID}"         '{environmentId:$environmentId,serviceId:$serviceId}')"
 
