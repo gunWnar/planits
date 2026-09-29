@@ -100,7 +100,6 @@ bootstrap_railway() {
     DOMAIN_TARGET_PORT="$(printf '%s' "${DOMAIN_RESPONSE}" | jq -r '.data.domains.serviceDomains[0].targetPort // empty')"
 
     if [ -z "${SERVICE_DOMAIN}" ]; then
-    if [ -z "${SERVICE_DOMAIN}" ]; then
         CREATE_DOMAIN='mutation($serviceId:String!,$environmentId:String!){serviceDomainCreate(serviceId:$serviceId,environmentId:$environmentId){id domain}}'
         CREATE_DOMAIN_VARS="$(jq -cn \
             --arg serviceId "${SERVICE_ID}" \
@@ -149,6 +148,7 @@ bootstrap_railway() {
         echo "Created Railway TCP Proxy for :${REALITY_PORT}."
     fi
 
+    fi
     TCP_HOST="$(printf '%s' "${TCP_PROXY_MATCH}" | jq -r '.domain')"
     TCP_PUBLIC_PORT="$(printf '%s' "${TCP_PROXY_MATCH}" | jq -r '.proxyPort')"
 
