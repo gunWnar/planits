@@ -1,253 +1,197 @@
 #!/bin/sh
-
 set -eu
 
 XRAY_BIN="/usr/local/bin/simpweb"
 CONFIG_DIR="/etc/web"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
+CADDYFILE="/etc/caddy/Caddyfile"
+RAILWAY_API_URL="https://backboard.railway.com/graphql/v2"
 
-mkdir -p "${CONFIG_DIR}"
+mkdir -p "${CONFIG_DIR}" /etc/caddy
 
-echo "======================================================"
-echo "        Xray VLESS Multi-Protocol Node"
-echo "======================================================"
+# -----------------------------
+# Runtime ports
+# -----------------------------
+WEB_PORT="${PORT:-8080}"
+REALITY_PORT="${REALITY_PORT:-2053}"
+XHTTP_PORT="${XHTTP_BACKEND_PORT:-10001}"
+GRPC_PORT="${GRPC_BACKEND_PORT:-10002}"
 
-# ======================================================
-# 1. 基础配置
-# ======================================================
-
-# 协议类型：
-#
-# tcp-reality
-# xhttp-tls
-# grpc-tls
-# all
-#
-# Railway 建议每个 Service 单独运行一种协议。
-# Koyeb / VPS 可以使用 all。
-PROTOCOL_TYPE="${PROTOCOL_TYPE:-tcp-reality}"
-
-# Railway / Koyeb 通常会注入 PORT
-BASE_PORT="${PORT:-8443}"
-
-TCP_PORT="${VLESS_TCP_PORT:-${BASE_PORT}}"
-XHTTP_PORT="${VLESS_XHTTP_PORT:-$((BASE_PORT + 1))}"
-GRPC_PORT="${VLESS_GRPC_PORT:-$((BASE_PORT + 2))}"
-
-# ======================================================
-# 2. Token
-# ======================================================
-
-# 不把 Token 写进代码。
-# 可以通过 TOKEN / PLATFORM_TOKEN / RAILWAY_API_TOKEN /
-# KOYEB_API_TOKEN 注入。
-#
-# 当前代码不会把 Token 打印出来。
-TOKEN="${TOKEN:-${PLATFORM_TOKEN:-}}"
-
-if [ -n "${TOKEN}" ]; then
-    echo "Platform token: detected"
-else
-    echo "Platform token: not set"
+# Exactly 8 alphanumeric characters for TLS/XHTTP path.
+TLS_PATH="${TLS_PATH:-}"
+if [ -z "${TLS_PATH}" ]; then
+    TLS_PATH="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8 || true)"
 fi
+TLS_PATH="${TLS_PATH:-a1B2c3D4}"
 
-# ======================================================
-# 3. UUID
-# ======================================================
+REALITY_SNI="${REALITY_SNI:-www.apple.com}"
+REALITY_TARGET="${REALITY_TARGET:-${REALITY_SNI}:443}"
 
-if [ -n "${UUID:-}" ]; then
-    NODE_UUID="${UUID}"
-else
-    NODE_UUID="$("${XRAY_BIN}" uuid | head -n 1 | tr -d '\r\n ')"
+# Railway terminates public TLS on its HTTPS domain.
+# The upstream Xray listeners therefore use security=none.
+TLS_SNI="${TLS_SNI:-}"
+
+UUID="${UUID:-}"
+if [ -z "${UUID}" ]; then
+    UUID="$("${XRAY_BIN}" uuid | head -n 1 | tr -d '\r\n ')"
 fi
-
-if [ -z "${NODE_UUID}" ]; then
-    echo "ERROR: UUID generation failed."
-    exit 1
-fi
-
-# ======================================================
-# 4. Reality Key
-# ======================================================
 
 SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 4 | tr -d '\r\n ')}"
 
 REALITY_KEYS="$("${XRAY_BIN}" x25519 2>&1)"
-
-PRIVATE_KEY="$(
-    printf '%s\n' "${REALITY_KEYS}" |
-    awk -F ': ' 'tolower($0) ~ /private key/ {print $2; exit}' |
-    tr -d '\r\n '
-)"
-
-PUBLIC_KEY="$(
-    printf '%s\n' "${REALITY_KEYS}" |
-    awk -F ': ' 'tolower($0) ~ /public key|password/ {print $2; exit}' |
-    tr -d '\r\n '
-)"
+PRIVATE_KEY="$(printf '%s\n' "${REALITY_KEYS}" | awk -F ': ' 'tolower($0) ~ /private key/ {print $2; exit}' | tr -d '\r\n ')"
+PUBLIC_KEY="$(printf '%s\n' "${REALITY_KEYS}" | awk -F ': ' 'tolower($0) ~ /public key|password/ {print $2; exit}' | tr -d '\r\n ')"
 
 if [ -z "${PRIVATE_KEY}" ] || [ -z "${PUBLIC_KEY}" ]; then
-    echo "ERROR: Reality key generation failed."
-    echo "${REALITY_KEYS}"
+    echo "ERROR: failed to generate Reality key pair."
     exit 1
 fi
 
-# ======================================================
-# 5. Reality
-# ======================================================
+# -----------------------------
+# Railway API helpers
+# -----------------------------
+railway_post() {
+    QUERY="$1"
+    VARIABLES="$2"
 
-# 按你的要求：
-# Reality 伪装 / SNI = Apple 官方网站
-REALITY_SNI="${REALITY_SNI:-www.apple.com}"
+    PAYLOAD="$(jq -cn         --arg query "${QUERY}"         --argjson variables "${VARIABLES}"         '{query:$query,variables:$variables}')"
 
-# Reality target
-REALITY_TARGET="${REALITY_TARGET:-${REALITY_SNI}:443}"
+    RESPONSE="$(curl -fsS --retry 3 --retry-delay 2         -H "Authorization: Bearer ${RAILWAY_API_TOKEN}"         -H "Content-Type: application/json"         --data "${PAYLOAD}"         "${RAILWAY_API_URL}")"
 
-# ======================================================
-# 6. TLS
-# ======================================================
+    if ! printf '%s' "${RESPONSE}" | jq -e '(.errors // []) | length == 0' >/dev/null; then
+        echo "ERROR: Railway API request failed:" >&2
+        printf '%s\n' "${RESPONSE}" | jq -c '.errors // .'
+        return 1
+    fi
 
-# 按你的要求：
-# TLS SNI = Microsoft 官方网站
-TLS_SNI="${TLS_SNI:-www.microsoft.com}"
+    printf '%s' "${RESPONSE}"
+}
 
-TLS_CERT_FILE="${TLS_CERT_FILE:-${CONFIG_DIR}/server.crt}"
-TLS_KEY_FILE="${TLS_KEY_FILE:-${CONFIG_DIR}/server.key}"
+bootstrap_railway() {
+    if [ -z "${RAILWAY_API_TOKEN:-}" ]; then
+        echo "ERROR: RAILWAY_API_TOKEN is required on Railway."
+        echo "Add it under Railway -> Service -> Variables, then redeploy."
+        exit 1
+    fi
 
-# ======================================================
-# 7. XHTTP
-# ======================================================
+    PROJECT_ID="${RAILWAY_PROJECT_ID:?RAILWAY_PROJECT_ID is missing}"
+    ENVIRONMENT_ID="${RAILWAY_ENVIRONMENT_ID:?RAILWAY_ENVIRONMENT_ID is missing}"
+    SERVICE_ID="${RAILWAY_SERVICE_ID:?RAILWAY_SERVICE_ID is missing}"
 
-XHTTP_PATH="${XHTTP_PATH:-}"
+    echo "Configuring Railway networking through the Public API..."
 
-if [ -z "${XHTTP_PATH}" ]; then
-    XHTTP_PATH="$(
-        tr -dc 'a-zA-Z0-9' < /dev/urandom |
-        head -c 12 |
-        tr -d '\r\n ' || true
-    )"
-fi
+    DOMAINS_QUERY='query($projectId:String!,$environmentId:String!,$serviceId:String!){domains(projectId:$projectId,environmentId:$environmentId,serviceId:$serviceId){serviceDomains{id domain targetPort}}}'
+    DOMAIN_VARS="$(jq -cn         --arg projectId "${PROJECT_ID}"         --arg environmentId "${ENVIRONMENT_ID}"         --arg serviceId "${SERVICE_ID}"         '{projectId:$projectId,environmentId:$environmentId,serviceId:$serviceId}')"
 
-XHTTP_PATH="${XHTTP_PATH:-xraypath123}"
+    DOMAIN_RESPONSE="$(railway_post "${DOMAINS_QUERY}" "${DOMAIN_VARS}")"
+    SERVICE_DOMAIN="$(printf '%s' "${DOMAIN_RESPONSE}" | jq -r '.data.domains.serviceDomains[0].domain // empty')"
+    SERVICE_DOMAIN_ID="$(printf '%s' "${DOMAIN_RESPONSE}" | jq -r '.data.domains.serviceDomains[0].id // empty')"
+    DOMAIN_TARGET_PORT="$(printf '%s' "${DOMAIN_RESPONSE}" | jq -r '.data.domains.serviceDomains[0].targetPort // empty')"
 
-# 保证 path 以 / 开头
-case "${XHTTP_PATH}" in
-    /*)
-        ;;
-    *)
-        XHTTP_PATH="/${XHTTP_PATH}"
-        ;;
-esac
+    if [ -z "${SERVICE_DOMAIN}" ]; then
+        CREATE_DOMAIN='mutation($input:ServiceDomainCreateInput!){serviceDomainCreate(input:$input){id domain targetPort}}'
+        CREATE_DOMAIN_VARS="$(jq -cn             --arg serviceId "${SERVICE_ID}"             --arg environmentId "${ENVIRONMENT_ID}"             '{input:{serviceId:$serviceId,environmentId:$environmentId}}')"
 
-# ======================================================
-# 8. gRPC
-# ======================================================
+        CREATE_DOMAIN_RESPONSE="$(railway_post "${CREATE_DOMAIN}" "${CREATE_DOMAIN_VARS}")"
+        SERVICE_DOMAIN="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.domain')"
+        SERVICE_DOMAIN_ID="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.id')"
+        DOMAIN_TARGET_PORT="$(printf '%s' "${CREATE_DOMAIN_RESPONSE}" | jq -r '.data.serviceDomainCreate.targetPort // empty')"
 
-GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-}"
+        echo "Created Railway service domain: ${SERVICE_DOMAIN}"
+    fi
 
-if [ -z "${GRPC_SERVICE_NAME}" ]; then
-    GRPC_SERVICE_NAME="$(
-        tr -dc 'a-zA-Z0-9' < /dev/urandom |
-        head -c 10 |
-        tr -d '\r\n ' || true
-    )"
-fi
+    # Ensure the Railway-provided HTTPS domain points at the HTTP port
+    # where Caddy listens. This keeps public traffic on :443.
+    if [ -n "${SERVICE_DOMAIN_ID}" ] && [ "${DOMAIN_TARGET_PORT:-}" != "${WEB_PORT}" ]; then
+        UPDATE_DOMAIN='mutation($input:ServiceDomainUpdateInput!){serviceDomainUpdate(input:$input){id domain targetPort}}'
+        UPDATE_DOMAIN_VARS="$(jq -cn             --arg serviceId "${SERVICE_ID}"             --arg environmentId "${ENVIRONMENT_ID}"             --arg domainId "${SERVICE_DOMAIN_ID}"             --arg domain "${SERVICE_DOMAIN}"             --argjson targetPort "${WEB_PORT}"             '{input:{serviceId:$serviceId,environmentId:$environmentId,serviceDomainId:$domainId,domain:$domain,targetPort:$targetPort}}')"
 
-GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-grpcservice}"
+        railway_post "${UPDATE_DOMAIN}" "${UPDATE_DOMAIN_VARS}" >/dev/null
+        echo "Updated Railway service domain target port to ${WEB_PORT}."
+    fi
 
-# ======================================================
-# 9. TLS Certificate
-# ======================================================
+    TCP_QUERY='query($environmentId:String!,$serviceId:String!){tcpProxies(environmentId:$environmentId,serviceId:$serviceId){id domain proxyPort applicationPort}}'
+    TCP_VARS="$(jq -cn         --arg environmentId "${ENVIRONMENT_ID}"         --arg serviceId "${SERVICE_ID}"         '{environmentId:$environmentId,serviceId:$serviceId}')"
 
-if [ -n "${TLS_CERT:-}" ] && [ -n "${TLS_KEY:-}" ]; then
+    TCP_RESPONSE="$(railway_post "${TCP_QUERY}" "${TCP_VARS}")"
 
-    echo "${TLS_CERT}" > "${TLS_CERT_FILE}"
-    echo "${TLS_KEY}" > "${TLS_KEY_FILE}"
+    TCP_PROXY_MATCH="$(printf '%s' "${TCP_RESPONSE}" |
+        jq -c --argjson port "${REALITY_PORT}" '.data.tcpProxies[]? | select(.applicationPort == $port)' |
+        head -n 1 || true)"
 
-    echo "Using TLS certificate from environment."
+    if [ -z "${TCP_PROXY_MATCH}" ]; then
+        TCP_COUNT="$(printf '%s' "${TCP_RESPONSE}" | jq '.data.tcpProxies | length')"
 
+        if [ "${TCP_COUNT}" -gt 0 ]; then
+            EXISTING="$(printf '%s' "${TCP_RESPONSE}" | jq -r '.data.tcpProxies[0] | "\(.domain):\(.proxyPort) -> :\(.applicationPort)"')"
+            echo "ERROR: this Railway service already has a TCP Proxy: ${EXISTING}" >&2
+            echo "Railway currently allows only one TCP Proxy per service." >&2
+            echo "Remove the old TCP Proxy in Railway and redeploy to let this project create :${REALITY_PORT}." >&2
+            exit 1
+        fi
+
+        CREATE_TCP='mutation($input:TCPProxyCreateInput!){tcpProxyCreate(input:$input){id domain proxyPort applicationPort}}'
+        CREATE_TCP_VARS="$(jq -cn             --arg serviceId "${SERVICE_ID}"             --arg environmentId "${ENVIRONMENT_ID}"             --argjson applicationPort "${REALITY_PORT}"             '{input:{serviceId:$serviceId,environmentId:$environmentId,applicationPort:$applicationPort}}')"
+
+        CREATE_TCP_RESPONSE="$(railway_post "${CREATE_TCP}" "${CREATE_TCP_VARS}")"
+        TCP_PROXY_MATCH="$(printf '%s' "${CREATE_TCP_RESPONSE}" | jq -c '.data.tcpProxyCreate')"
+
+        echo "Created Railway TCP Proxy for :${REALITY_PORT}."
+    fi
+
+    TCP_HOST="$(printf '%s' "${TCP_PROXY_MATCH}" | jq -r '.domain')"
+    TCP_PUBLIC_PORT="$(printf '%s' "${TCP_PROXY_MATCH}" | jq -r '.proxyPort')"
+
+    TLS_SNI="${TLS_SNI:-${SERVICE_DOMAIN}}"
+
+    # The token is only needed for bootstrap; do not pass it to children.
+    unset RAILWAY_API_TOKEN
+
+    echo "Railway service domain: ${SERVICE_DOMAIN}:443"
+    echo "Railway TCP proxy: ${TCP_HOST}:${TCP_PUBLIC_PORT}"
+}
+
+# -----------------------------
+# Platform detection
+# -----------------------------
+SERVICE_DOMAIN=""
+TCP_HOST=""
+TCP_PUBLIC_PORT=""
+
+if [ -n "${RAILWAY_SERVICE_ID:-}" ] && [ -n "${RAILWAY_ENVIRONMENT_ID:-}" ]; then
+    bootstrap_railway
 else
-
-    if [ ! -f "${TLS_CERT_FILE}" ] || [ ! -f "${TLS_KEY_FILE}" ]; then
-
-        echo "TLS certificate not found."
-        echo "Generating temporary self-signed certificate..."
-
-        openssl req \
-            -x509 \
-            -nodes \
-            -days 3650 \
-            -newkey rsa:2048 \
-            -keyout "${TLS_KEY_FILE}" \
-            -out "${TLS_CERT_FILE}" \
-            -subj "/CN=${TLS_SNI}" \
-            2>/dev/null
-
-    fi
-
+    SERVICE_DOMAIN="${PUBLIC_HOST:-YOUR_PUBLIC_HOST}"
+    TLS_SNI="${TLS_SNI:-${SERVICE_DOMAIN}}"
+    TCP_HOST="${VLESS_TCP_PUBLIC_HOST:-${SERVICE_DOMAIN}}"
+    TCP_PUBLIC_PORT="${VLESS_TCP_PUBLIC_PORT:-${REALITY_PORT}}"
 fi
 
-# ======================================================
-# 10. Public Host
-# ======================================================
-
-PUBLIC_HOST="${PUBLIC_HOST:-}"
-
-if [ -z "${PUBLIC_HOST}" ]; then
-
-    if [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ]; then
-        PUBLIC_HOST="${RAILWAY_TCP_PROXY_DOMAIN}"
-
-    elif [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
-        PUBLIC_HOST="${RAILWAY_PUBLIC_DOMAIN}"
-
-    elif [ -n "${KOYEB_PUBLIC_DOMAIN:-}" ]; then
-        PUBLIC_HOST="${KOYEB_PUBLIC_DOMAIN}"
-
-    fi
-
-fi
-
-PUBLIC_HOST="${PUBLIC_HOST:-YOUR_PUBLIC_HOST}"
-
-# ======================================================
-# 11. Public Ports
-# ======================================================
-
-TCP_PUBLIC_PORT="${VLESS_TCP_PUBLIC_PORT:-}"
-
-XHTTP_PUBLIC_PORT="${VLESS_XHTTP_PUBLIC_PORT:-}"
-
-GRPC_PUBLIC_PORT="${VLESS_GRPC_PUBLIC_PORT:-}"
-
-# Railway 自带的 TCP Proxy
-if [ -z "${TCP_PUBLIC_PORT}" ] && [ -n "${RAILWAY_TCP_PROXY_PORT:-}" ]; then
-    TCP_PUBLIC_PORT="${RAILWAY_TCP_PROXY_PORT}"
-fi
-
-# ======================================================
-# 12. Config Helpers
-# ======================================================
-
-write_tcp_reality() {
-
-cat >> "${CONFIG_FILE}" <<EOF
+# -----------------------------
+# Xray config
+# -----------------------------
+cat > "${CONFIG_FILE}" <<EOF
+{
+  "log": {
+    "loglevel": "${LOG_LEVEL:-warning}"
+  },
+  "inbounds": [
     {
       "tag": "vless-tcp-reality",
       "listen": "0.0.0.0",
-      "port": ${TCP_PORT},
+      "port": ${REALITY_PORT},
       "protocol": "vless",
       "settings": {
         "clients": [
           {
-            "id": "${NODE_UUID}",
+            "id": "${UUID}",
             "flow": "xtls-rprx-vision"
           }
         ],
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "tcp",
+        "network": "raw",
         "security": "reality",
         "realitySettings": {
           "show": false,
@@ -261,147 +205,50 @@ cat >> "${CONFIG_FILE}" <<EOF
           ]
         }
       }
-    }
-EOF
-
-}
-
-write_xhttp_tls() {
-
-cat >> "${CONFIG_FILE}" <<EOF
+    },
     {
       "tag": "vless-xhttp-tls",
-      "listen": "0.0.0.0",
+      "listen": "127.0.0.1",
       "port": ${XHTTP_PORT},
       "protocol": "vless",
       "settings": {
         "clients": [
           {
-            "id": "${NODE_UUID}"
+            "id": "${UUID}"
           }
         ],
         "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
-        "security": "tls",
-        "tlsSettings": {
-          "certificates": [
-            {
-              "certificateFile": "${TLS_CERT_FILE}",
-              "keyFile": "${TLS_KEY_FILE}"
-            }
-          ],
-          "alpn": [
-            "h2",
-            "http/1.1"
-          ]
-        },
+        "security": "none",
         "xhttpSettings": {
           "mode": "auto",
-          "path": "${XHTTP_PATH}"
+          "path": "/${TLS_PATH}"
         }
       }
-    }
-EOF
-
-}
-
-write_grpc_tls() {
-
-cat >> "${CONFIG_FILE}" <<EOF
+    },
     {
       "tag": "vless-grpc-tls",
-      "listen": "0.0.0.0",
+      "listen": "127.0.0.1",
       "port": ${GRPC_PORT},
       "protocol": "vless",
       "settings": {
         "clients": [
           {
-            "id": "${NODE_UUID}"
+            "id": "${UUID}"
           }
         ],
         "decryption": "none"
       },
       "streamSettings": {
         "network": "grpc",
-        "security": "tls",
-        "tlsSettings": {
-          "certificates": [
-            {
-              "certificateFile": "${TLS_CERT_FILE}",
-              "keyFile": "${TLS_KEY_FILE}"
-            }
-          ],
-          "alpn": [
-            "h2"
-          ]
-        },
+        "security": "none",
         "grpcSettings": {
-          "serviceName": "${GRPC_SERVICE_NAME}"
+          "serviceName": "${TLS_PATH}"
         }
       }
     }
-EOF
-
-}
-
-# ======================================================
-# 13. Generate Xray Config
-# ======================================================
-
-cat > "${CONFIG_FILE}" <<EOF
-{
-  "log": {
-    "loglevel": "${LOG_LEVEL:-warning}"
-  },
-  "inbounds": [
-EOF
-
-case "${PROTOCOL_TYPE}" in
-
-    tcp-reality)
-
-        write_tcp_reality
-        ;;
-
-    xhttp-tls)
-
-        write_xhttp_tls
-        ;;
-
-    grpc-tls)
-
-        write_grpc_tls
-        ;;
-
-    all)
-
-        write_tcp_reality
-        printf ',\n' >> "${CONFIG_FILE}"
-
-        write_xhttp_tls
-        printf ',\n' >> "${CONFIG_FILE}"
-
-        write_grpc_tls
-        ;;
-
-    *)
-
-        echo "ERROR: Unsupported PROTOCOL_TYPE:"
-        echo "${PROTOCOL_TYPE}"
-        echo
-        echo "Supported:"
-        echo "  tcp-reality"
-        echo "  xhttp-tls"
-        echo "  grpc-tls"
-        echo "  all"
-        exit 1
-        ;;
-
-esac
-
-cat >> "${CONFIG_FILE}" <<EOF
   ],
   "outbounds": [
     {
@@ -416,143 +263,113 @@ cat >> "${CONFIG_FILE}" <<EOF
 }
 EOF
 
-# ======================================================
-# 14. Fix JSON commas for single inbound
-# ======================================================
-
-if [ "${PROTOCOL_TYPE}" != "all" ]; then
-    # 单入口 JSON 已经合法，无需处理
-    :
-fi
-
-# ======================================================
-# 15. Validate config
-# ======================================================
-
-echo
-echo "Checking Xray configuration..."
-
+# Validate generated Xray configuration before starting anything.
 "${XRAY_BIN}" run -test -c "${CONFIG_FILE}"
 
-echo
-echo "Xray configuration OK."
-echo
+# -----------------------------
+# Caddy: public HTTPS edge target
+# -----------------------------
+# Railway terminates client TLS at its HTTPS edge and sends HTTP to PORT.
+# Caddy routes the randomized XHTTP path and gRPC path to local Xray ports.
+cat > "${CADDYFILE}" <<EOF
+:${WEB_PORT} {
+    @health path /health
+    respond @health 200
 
-# ======================================================
-# 16. Build VLESS links
-# ======================================================
+    @grpc path /${TLS_PATH}/Tun*
+    reverse_proxy @grpc h2c://127.0.0.1:${GRPC_PORT}
 
-echo "======================================================"
-echo "              VLESS NODE INFORMATION"
-echo "======================================================"
+    @xhttp path /${TLS_PATH}*
+    reverse_proxy @xhttp 127.0.0.1:${XHTTP_PORT}
 
-echo
-echo "Protocol:"
-echo "${PROTOCOL_TYPE}"
+    respond 404
+}
+EOF
 
-echo
-echo "UUID:"
-echo "${NODE_UUID}"
-
-echo
-echo "VLESS Encryption:"
-echo "none"
-
-echo
-echo "Reality SNI:"
-echo "${REALITY_SNI}"
-
-echo
-echo "Reality Public Key:"
-echo "${PUBLIC_KEY}"
-
-echo
-echo "Reality Short ID:"
-echo "${SHORT_ID}"
-
-echo
-echo "TLS SNI:"
-echo "${TLS_SNI}"
-
-echo
-echo "XHTTP Path:"
-echo "${XHTTP_PATH}"
-
-echo
-echo "gRPC Service Name:"
-echo "${GRPC_SERVICE_NAME}"
-
-echo
-echo "------------------------------------------------------"
-echo
-
-# ======================================================
-# 17. TCP + Reality Link
-# ======================================================
-
-if [ "${PROTOCOL_TYPE}" = "tcp-reality" ] || [ "${PROTOCOL_TYPE}" = "all" ]; then
-
-    TCP_LINK_PORT="${TCP_PUBLIC_PORT:-${TCP_PORT}}"
-    TCP_LINK_HOST="${VLESS_TCP_PUBLIC_HOST:-${PUBLIC_HOST}}"
-
-    TCP_LINK="vless://${NODE_UUID}@${TCP_LINK_HOST}:${TCP_LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#VLESS-TCP-Reality"
-
-    echo "VLESS + TCP + Reality"
-    echo
-    echo "${TCP_LINK}"
-    echo
-
+if ! caddy validate --config "${CADDYFILE}" --adapter caddyfile >/dev/null; then
+    echo "ERROR: Caddy configuration validation failed."
+    exit 1
 fi
 
-# ======================================================
-# 18. XHTTP + TLS Link
-# ======================================================
-
-if [ "${PROTOCOL_TYPE}" = "xhttp-tls" ] || [ "${PROTOCOL_TYPE}" = "all" ]; then
-
-    XHTTP_LINK_PORT="${XHTTP_PUBLIC_PORT:-${XHTTP_PORT}}"
-    XHTTP_LINK_HOST="${VLESS_XHTTP_PUBLIC_HOST:-${PUBLIC_HOST}}"
-
-    XHTTP_LINK="vless://${NODE_UUID}@${XHTTP_LINK_HOST}:${XHTTP_LINK_PORT}?encryption=none&security=tls&type=xhttp&path=$(printf '%s' "${XHTTP_PATH}" | sed 's#/#%2F#g')&sni=${TLS_SNI}&fp=chrome&allowInsecure=1#VLESS-XHTTP-TLS"
-
-    echo "VLESS + XHTTP + TLS"
-    echo
-    echo "${XHTTP_LINK}"
-    echo
-
-fi
-
-# ======================================================
-# 19. gRPC + TLS Link
-# ======================================================
-
-if [ "${PROTOCOL_TYPE}" = "grpc-tls" ] || [ "${PROTOCOL_TYPE}" = "all" ]; then
-
-    GRPC_LINK_PORT="${GRPC_PUBLIC_PORT:-${GRPC_PORT}}"
-    GRPC_LINK_HOST="${VLESS_GRPC_PUBLIC_HOST:-${PUBLIC_HOST}}"
-
-    GRPC_LINK="vless://${NODE_UUID}@${GRPC_LINK_HOST}:${GRPC_LINK_PORT}?encryption=none&security=tls&type=grpc&serviceName=${GRPC_SERVICE_NAME}&sni=${TLS_SNI}&fp=chrome&alpn=h2&allowInsecure=1#VLESS-gRPC-TLS"
-
-    echo "VLESS + gRPC + TLS"
-    echo
-    echo "${GRPC_LINK}"
-    echo
-
-fi
-
+# -----------------------------
+# Output node information
+# -----------------------------
+echo
+echo "======================================================"
+echo "             VLESS NODE INFORMATION"
 echo "======================================================"
 echo
-echo "Xray binary:"
-echo "${XRAY_BIN}"
+echo "UUID: ${UUID}"
 echo
-echo "Config:"
-echo "${CONFIG_FILE}"
+echo "VLESS encryption: none"
 echo
-echo "Starting Xray..."
+echo "Reality SNI: ${REALITY_SNI}"
+echo "Reality Public Key: ${PUBLIC_KEY}"
+echo "Reality Short ID: ${SHORT_ID}"
+echo
+echo "TLS public SNI: ${TLS_SNI}"
+echo "TLS random path: /${TLS_PATH}"
 echo
 
-# ======================================================
-# 20. Start
-# ======================================================
+REALITY_LINK="vless://${UUID}@${TCP_HOST}:${TCP_PUBLIC_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#VLESS-TCP-Reality"
 
-exec "${XRAY_BIN}" run -c "${CONFIG_FILE}"
+XHTTP_LINK="vless://${UUID}@${SERVICE_DOMAIN}:443?encryption=none&security=tls&type=xhttp&path=%2F${TLS_PATH}&sni=${TLS_SNI}&fp=chrome#VLESS-XHTTP-TLS"
+
+GRPC_LINK="vless://${UUID}@${SERVICE_DOMAIN}:443?encryption=none&security=tls&type=grpc&serviceName=${TLS_PATH}&sni=${TLS_SNI}&fp=chrome&alpn=h2#VLESS-gRPC-TLS"
+
+echo "VLESS + TCP + Reality:"
+echo
+echo "${REALITY_LINK}"
+echo
+
+echo "VLESS + XHTTP + TLS:"
+echo
+echo "${XHTTP_LINK}"
+echo
+
+echo "VLESS + gRPC + TLS:"
+echo
+echo "${GRPC_LINK}"
+echo
+
+echo "======================================================"
+echo "IMPORTANT:"
+echo "Railway HTTPS :443 can serve XHTTP through the HTTP edge."
+echo "Railway's HTTP edge converts incoming HTTP/2 to HTTP/1.1 upstream,"
+echo "so Xray gRPC is not usable through the Railway HTTPS domain."
+echo "The gRPC link is printed for Koyeb/VPS/direct TCP deployments."
+echo "======================================================"
+echo
+
+# -----------------------------
+# Start Xray + Caddy
+# -----------------------------
+"${XRAY_BIN}" run -c "${CONFIG_FILE}" &
+XRAY_PID=$!
+
+caddy run --config "${CADDYFILE}" --adapter caddyfile &
+CADDY_PID=$!
+
+cleanup() {
+    kill "${XRAY_PID}" "${CADDY_PID}" 2>/dev/null || true
+    wait "${XRAY_PID}" 2>/dev/null || true
+    wait "${CADDY_PID}" 2>/dev/null || true
+}
+
+trap cleanup INT TERM EXIT
+
+while kill -0 "${XRAY_PID}" 2>/dev/null && kill -0 "${CADDY_PID}" 2>/dev/null; do
+    sleep 2
+done
+
+if ! kill -0 "${XRAY_PID}" 2>/dev/null; then
+    wait "${XRAY_PID}" || true
+    exit 1
+fi
+
+if ! kill -0 "${CADDY_PID}" 2>/dev/null; then
+    wait "${CADDY_PID}" || true
+    exit 1
+fi
+
+exit 1
