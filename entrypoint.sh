@@ -1,159 +1,558 @@
 #!/bin/sh
 
-# 1. 动态获取环境端口 (适配 Railway / Koyeb / 纯 VPS)
-if [ -n "$PORT" ]; then
-    LISTEN_PORT=$PORT
-else
-    LISTEN_PORT=$(awk 'BEGIN{srand();print int(rand()*64536)+1000}')
-fi
+set -eu
 
-# 获取对外显示的域名和外网端口
-if [ -n "$RAILWAY_TCP_PROXY_DOMAIN" ]; then
-    CLIENT_IP="$RAILWAY_TCP_PROXY_DOMAIN"
-    CLIENT_PORT="$RAILWAY_TCP_PROXY_PORT"
-elif [ -n "$RAILWAY_PUBLIC_DOMAIN" ]; then
-    CLIENT_IP="$RAILWAY_PUBLIC_DOMAIN"
-    CLIENT_PORT="443"
-elif [ -n "$KOYEB_PUBLIC_DOMAIN" ]; then
-    CLIENT_IP="$KOYEB_PUBLIC_DOMAIN"
-    CLIENT_PORT="443"
-else
-    CLIENT_IP="你的云平台域名或VPS公网IP"
-    CLIENT_PORT=$LISTEN_PORT
-fi
+XRAY_BIN="/usr/local/bin/simpweb"
+CONFIG_DIR="/etc/web"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
 
-# 2. 获取节点协议类型 (默认设为 xhttp-reality)
-PROTOCOL_TYPE=${PROTOCOL_TYPE:-"xhttp-reality"}
+mkdir -p "${CONFIG_DIR}"
+
 echo "======================================================"
-echo "⚙️ 当前部署节点协议类型: $PROTOCOL_TYPE"
+echo "        Xray VLESS Multi-Protocol Node"
 echo "======================================================"
 
-# 3. 核心密钥提取 (使用最强健的正则和列提取，无视Xray格式暗改)
-UUID=$(/usr/local/bin/web uuid | head -n 1 | tr -d '\r\n ')
-SHORT_ID=$(openssl rand -hex 4 | tr -d '\r\n ')
-PATH_STR=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8 | tr -d '\r\n ')
+# ======================================================
+# 1. 基础配置
+# ======================================================
 
-REALITY_KEYS=$(/usr/local/bin/web x25519 2>&1)
-PRIVATE_KEY=$(echo "$REALITY_KEYS" | grep -iE "Private" | head -n 1 | awk -F ':' '{print $2}' | tr -d '\r\n ')
-PUBLIC_KEY=$(echo "$REALITY_KEYS" | grep -iE "Public|Password" | head -n 1 | awk -F ':' '{print $2}' | tr -d '\r\n ')
+# 协议类型：
+#
+# tcp-reality
+# xhttp-tls
+# grpc-tls
+# all
+#
+# Railway 建议每个 Service 单独运行一种协议。
+# Koyeb / VPS 可以使用 all。
+PROTOCOL_TYPE="${PROTOCOL_TYPE:-tcp-reality}"
 
-VLESSENC=$(/usr/local/bin/web vlessenc 2>&1)
-DECRYPTION=$(echo "$VLESSENC" | grep '"decryption"' | head -n 1 | awk -F '"' '{print $4}' | tr -d '\r\n ')
-ENCRYPTION=$(echo "$VLESSENC" | grep '"encryption"' | head -n 1 | awk -F '"' '{print $4}' | tr -d '\r\n ')
+# Railway / Koyeb 通常会注入 PORT
+BASE_PORT="${PORT:-8443}"
 
-# 4. 随机选择伪装域名
-if [ "$PROTOCOL_TYPE" = "raw-tls" ]; then
-    # TLS 模式按照要求使用游戏资讯网站
-    DOMAINS="www.ign.com www.gamespot.com www.polygon.com"
-    set -- $DOMAINS
-    shift $(expr $(awk 'BEGIN{srand();print int(rand()*3)}') )
-    SNI=$1
+TCP_PORT="${VLESS_TCP_PORT:-${BASE_PORT}}"
+XHTTP_PORT="${VLESS_XHTTP_PORT:-$((BASE_PORT + 1))}"
+GRPC_PORT="${VLESS_GRPC_PORT:-$((BASE_PORT + 2))}"
+
+# ======================================================
+# 2. Token
+# ======================================================
+
+# 不把 Token 写进代码。
+# 可以通过 TOKEN / PLATFORM_TOKEN / RAILWAY_API_TOKEN /
+# KOYEB_API_TOKEN 注入。
+#
+# 当前代码不会把 Token 打印出来。
+TOKEN="${TOKEN:-${PLATFORM_TOKEN:-}}"
+
+if [ -n "${TOKEN}" ]; then
+    echo "Platform token: detected"
 else
-    # REALITY 模式使用常规大厂
-    DOMAINS="www.bing.com www.yahoo.com"
-    set -- $DOMAINS
-    shift $(expr $(awk 'BEGIN{srand();print int(rand()*2)}') )
-    SNI=$1
+    echo "Platform token: not set"
 fi
 
-# 5. 根据协议类型动态生成完整配置 (直接抛弃sed和jq，使用原生Heredoc)
-if [ "$PROTOCOL_TYPE" = "xhttp-reality" ]; then
-cat <<EOF > /etc/web/config.json
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [{
-    "tag": "vless-xhttp-reality",
-    "listen": "0.0.0.0",
-    "port": $LISTEN_PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
-      "decryption": "$DECRYPTION"
-    },
-    "streamSettings": {
-      "network": "xhttp",
-      "security": "reality",
-      "xhttpSettings": {"mode": "auto", "path": "/$PATH_STR"},
-      "realitySettings": {
-        "target": "$SNI:443",
-        "serverNames": ["$SNI"],
-        "privateKey": "$PRIVATE_KEY",
-        "shortIds": ["$SHORT_ID"]
-      }
-    }
-  }],
-  "outbounds": [{"protocol": "freedom","tag": "direct"},{"protocol": "blackhole","tag": "block"}]
-}
-EOF
-VLESS_LINK="vless://${UUID}@${CLIENT_IP}:${CLIENT_PORT}?type=xhttp&security=reality&encryption=${ENCRYPTION}&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&path=%2F${PATH_STR}&flow=xtls-rprx-vision#Xray-XHTTP-Reality"
+# ======================================================
+# 3. UUID
+# ======================================================
 
-elif [ "$PROTOCOL_TYPE" = "tcp-reality" ]; then
-cat <<EOF > /etc/web/config.json
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [{
-    "tag": "vless-tcp-reality",
-    "listen": "0.0.0.0",
-    "port": $LISTEN_PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
-      "decryption": "$DECRYPTION"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "target": "$SNI:443",
-        "serverNames": ["$SNI"],
-        "privateKey": "$PRIVATE_KEY",
-        "shortIds": ["$SHORT_ID"]
-      }
-    }
-  }],
-  "outbounds": [{"protocol": "freedom","tag": "direct"},{"protocol": "blackhole","tag": "block"}]
-}
-EOF
-VLESS_LINK="vless://${UUID}@${CLIENT_IP}:${CLIENT_PORT}?type=tcp&security=reality&encryption=${ENCRYPTION}&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&flow=xtls-rprx-vision#Xray-TCP-Reality"
-
-elif [ "$PROTOCOL_TYPE" = "raw-tls" ]; then
-# 为 RAW+TLS 模式自动生成 10 年自签名证书
-openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout /etc/web/server.key -out /etc/web/server.crt -subj "/CN=$SNI" 2>/dev/null
-cat <<EOF > /etc/web/config.json
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [{
-    "tag": "vless-raw-tls",
-    "listen": "0.0.0.0",
-    "port": $LISTEN_PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
-      "decryption": "$DECRYPTION"
-    },
-    "streamSettings": {
-      "network": "raw",
-      "security": "tls",
-      "tlsSettings": {
-        "certificates": [{"certificateFile": "/etc/web/server.crt", "keyFile": "/etc/web/server.key"}]
-      }
-    }
-  }],
-  "outbounds": [{"protocol": "freedom","tag": "direct"},{"protocol": "blackhole","tag": "block"}]
-}
-EOF
-# 注意: RAW+TLS 因为是自签证书，客户端必须设置 allowInsecure=1 (跳过证书验证)
-VLESS_LINK="vless://${UUID}@${CLIENT_IP}:${CLIENT_PORT}?type=raw&security=tls&encryption=${ENCRYPTION}&fp=chrome&sni=${SNI}&allowInsecure=1&flow=xtls-rprx-vision#Xray-RAW-TLS"
+if [ -n "${UUID:-}" ]; then
+    NODE_UUID="${UUID}"
+else
+    NODE_UUID="$("${XRAY_BIN}" uuid | head -n 1 | tr -d '\r\n ')"
 fi
 
-# 6. 打印输出
-echo "🎯 节点初始化成功！"
-echo "🔗 节点分享链接 (直接复制到最新版 v2rayN / Shadowrocket 导入):"
-echo ""
-echo "$VLESS_LINK"
-echo ""
-echo "⚠️ 注意：如果是部署在云平台且未自动识别域名，请手动将链接中的 IP 和 端口 替换为您自己的公网域名和映射端口。"
+if [ -z "${NODE_UUID}" ]; then
+    echo "ERROR: UUID generation failed."
+    exit 1
+fi
+
+# ======================================================
+# 4. Reality Key
+# ======================================================
+
+SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 4 | tr -d '\r\n ')}"
+
+REALITY_KEYS="$("${XRAY_BIN}" x25519 2>&1)"
+
+PRIVATE_KEY="$(
+    printf '%s\n' "${REALITY_KEYS}" |
+    awk -F ': ' 'tolower($0) ~ /private key/ {print $2; exit}' |
+    tr -d '\r\n '
+)"
+
+PUBLIC_KEY="$(
+    printf '%s\n' "${REALITY_KEYS}" |
+    awk -F ': ' 'tolower($0) ~ /public key|password/ {print $2; exit}' |
+    tr -d '\r\n '
+)"
+
+if [ -z "${PRIVATE_KEY}" ] || [ -z "${PUBLIC_KEY}" ]; then
+    echo "ERROR: Reality key generation failed."
+    echo "${REALITY_KEYS}"
+    exit 1
+fi
+
+# ======================================================
+# 5. Reality
+# ======================================================
+
+# 按你的要求：
+# Reality 伪装 / SNI = Apple 官方网站
+REALITY_SNI="${REALITY_SNI:-www.apple.com}"
+
+# Reality target
+REALITY_TARGET="${REALITY_TARGET:-${REALITY_SNI}:443}"
+
+# ======================================================
+# 6. TLS
+# ======================================================
+
+# 按你的要求：
+# TLS SNI = Microsoft 官方网站
+TLS_SNI="${TLS_SNI:-www.microsoft.com}"
+
+TLS_CERT_FILE="${TLS_CERT_FILE:-${CONFIG_DIR}/server.crt}"
+TLS_KEY_FILE="${TLS_KEY_FILE:-${CONFIG_DIR}/server.key}"
+
+# ======================================================
+# 7. XHTTP
+# ======================================================
+
+XHTTP_PATH="${XHTTP_PATH:-}"
+
+if [ -z "${XHTTP_PATH}" ]; then
+    XHTTP_PATH="$(
+        tr -dc 'a-zA-Z0-9' < /dev/urandom |
+        head -c 12 |
+        tr -d '\r\n ' || true
+    )"
+fi
+
+XHTTP_PATH="${XHTTP_PATH:-xraypath123}"
+
+# 保证 path 以 / 开头
+case "${XHTTP_PATH}" in
+    /*)
+        ;;
+    *)
+        XHTTP_PATH="/${XHTTP_PATH}"
+        ;;
+esac
+
+# ======================================================
+# 8. gRPC
+# ======================================================
+
+GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-}"
+
+if [ -z "${GRPC_SERVICE_NAME}" ]; then
+    GRPC_SERVICE_NAME="$(
+        tr -dc 'a-zA-Z0-9' < /dev/urandom |
+        head -c 10 |
+        tr -d '\r\n ' || true
+    )"
+fi
+
+GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-grpcservice}"
+
+# ======================================================
+# 9. TLS Certificate
+# ======================================================
+
+if [ -n "${TLS_CERT:-}" ] && [ -n "${TLS_KEY:-}" ]; then
+
+    echo "${TLS_CERT}" > "${TLS_CERT_FILE}"
+    echo "${TLS_KEY}" > "${TLS_KEY_FILE}"
+
+    echo "Using TLS certificate from environment."
+
+else
+
+    if [ ! -f "${TLS_CERT_FILE}" ] || [ ! -f "${TLS_KEY_FILE}" ]; then
+
+        echo "TLS certificate not found."
+        echo "Generating temporary self-signed certificate..."
+
+        openssl req \
+            -x509 \
+            -nodes \
+            -days 3650 \
+            -newkey rsa:2048 \
+            -keyout "${TLS_KEY_FILE}" \
+            -out "${TLS_CERT_FILE}" \
+            -subj "/CN=${TLS_SNI}" \
+            2>/dev/null
+
+    fi
+
+fi
+
+# ======================================================
+# 10. Public Host
+# ======================================================
+
+PUBLIC_HOST="${PUBLIC_HOST:-}"
+
+if [ -z "${PUBLIC_HOST}" ]; then
+
+    if [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ]; then
+        PUBLIC_HOST="${RAILWAY_TCP_PROXY_DOMAIN}"
+
+    elif [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
+        PUBLIC_HOST="${RAILWAY_PUBLIC_DOMAIN}"
+
+    elif [ -n "${KOYEB_PUBLIC_DOMAIN:-}" ]; then
+        PUBLIC_HOST="${KOYEB_PUBLIC_DOMAIN}"
+
+    fi
+
+fi
+
+PUBLIC_HOST="${PUBLIC_HOST:-YOUR_PUBLIC_HOST}"
+
+# ======================================================
+# 11. Public Ports
+# ======================================================
+
+TCP_PUBLIC_PORT="${VLESS_TCP_PUBLIC_PORT:-}"
+
+XHTTP_PUBLIC_PORT="${VLESS_XHTTP_PUBLIC_PORT:-}"
+
+GRPC_PUBLIC_PORT="${VLESS_GRPC_PUBLIC_PORT:-}"
+
+# Railway 自带的 TCP Proxy
+if [ -z "${TCP_PUBLIC_PORT}" ] && [ -n "${RAILWAY_TCP_PROXY_PORT:-}" ]; then
+    TCP_PUBLIC_PORT="${RAILWAY_TCP_PROXY_PORT}"
+fi
+
+# ======================================================
+# 12. Config Helpers
+# ======================================================
+
+write_tcp_reality() {
+
+cat >> "${CONFIG_FILE}" <<EOF
+    {
+      "tag": "vless-tcp-reality",
+      "listen": "0.0.0.0",
+      "port": ${TCP_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${NODE_UUID}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "${REALITY_TARGET}",
+          "serverNames": [
+            "${REALITY_SNI}"
+          ],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": [
+            "${SHORT_ID}"
+          ]
+        }
+      }
+    }
+EOF
+
+}
+
+write_xhttp_tls() {
+
+cat >> "${CONFIG_FILE}" <<EOF
+    {
+      "tag": "vless-xhttp-tls",
+      "listen": "0.0.0.0",
+      "port": ${XHTTP_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${NODE_UUID}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${TLS_CERT_FILE}",
+              "keyFile": "${TLS_KEY_FILE}"
+            }
+          ],
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ]
+        },
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "${XHTTP_PATH}"
+        }
+      }
+    }
+EOF
+
+}
+
+write_grpc_tls() {
+
+cat >> "${CONFIG_FILE}" <<EOF
+    {
+      "tag": "vless-grpc-tls",
+      "listen": "0.0.0.0",
+      "port": ${GRPC_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${NODE_UUID}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${TLS_CERT_FILE}",
+              "keyFile": "${TLS_KEY_FILE}"
+            }
+          ],
+          "alpn": [
+            "h2"
+          ]
+        },
+        "grpcSettings": {
+          "serviceName": "${GRPC_SERVICE_NAME}"
+        }
+      }
+    }
+EOF
+
+}
+
+# ======================================================
+# 13. Generate Xray Config
+# ======================================================
+
+cat > "${CONFIG_FILE}" <<EOF
+{
+  "log": {
+    "loglevel": "${LOG_LEVEL:-warning}"
+  },
+  "inbounds": [
+EOF
+
+case "${PROTOCOL_TYPE}" in
+
+    tcp-reality)
+
+        write_tcp_reality
+        ;;
+
+    xhttp-tls)
+
+        write_xhttp_tls
+        ;;
+
+    grpc-tls)
+
+        write_grpc_tls
+        ;;
+
+    all)
+
+        write_tcp_reality
+        printf ',\n' >> "${CONFIG_FILE}"
+
+        write_xhttp_tls
+        printf ',\n' >> "${CONFIG_FILE}"
+
+        write_grpc_tls
+        ;;
+
+    *)
+
+        echo "ERROR: Unsupported PROTOCOL_TYPE:"
+        echo "${PROTOCOL_TYPE}"
+        echo
+        echo "Supported:"
+        echo "  tcp-reality"
+        echo "  xhttp-tls"
+        echo "  grpc-tls"
+        echo "  all"
+        exit 1
+        ;;
+
+esac
+
+cat >> "${CONFIG_FILE}" <<EOF
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
+EOF
+
+# ======================================================
+# 14. Fix JSON commas for single inbound
+# ======================================================
+
+if [ "${PROTOCOL_TYPE}" != "all" ]; then
+    # 单入口 JSON 已经合法，无需处理
+    :
+fi
+
+# ======================================================
+# 15. Validate config
+# ======================================================
+
+echo
+echo "Checking Xray configuration..."
+
+"${XRAY_BIN}" run -test -c "${CONFIG_FILE}"
+
+echo
+echo "Xray configuration OK."
+echo
+
+# ======================================================
+# 16. Build VLESS links
+# ======================================================
+
+echo "======================================================"
+echo "              VLESS NODE INFORMATION"
 echo "======================================================"
 
-# 7. 启动进程
-exec /usr/local/bin/web run -c /etc/web/config.json
+echo
+echo "Protocol:"
+echo "${PROTOCOL_TYPE}"
+
+echo
+echo "UUID:"
+echo "${NODE_UUID}"
+
+echo
+echo "VLESS Encryption:"
+echo "none"
+
+echo
+echo "Reality SNI:"
+echo "${REALITY_SNI}"
+
+echo
+echo "Reality Public Key:"
+echo "${PUBLIC_KEY}"
+
+echo
+echo "Reality Short ID:"
+echo "${SHORT_ID}"
+
+echo
+echo "TLS SNI:"
+echo "${TLS_SNI}"
+
+echo
+echo "XHTTP Path:"
+echo "${XHTTP_PATH}"
+
+echo
+echo "gRPC Service Name:"
+echo "${GRPC_SERVICE_NAME}"
+
+echo
+echo "------------------------------------------------------"
+echo
+
+# ======================================================
+# 17. TCP + Reality Link
+# ======================================================
+
+if [ "${PROTOCOL_TYPE}" = "tcp-reality" ] || [ "${PROTOCOL_TYPE}" = "all" ]; then
+
+    TCP_LINK_PORT="${TCP_PUBLIC_PORT:-${TCP_PORT}}"
+    TCP_LINK_HOST="${VLESS_TCP_PUBLIC_HOST:-${PUBLIC_HOST}}"
+
+    TCP_LINK="vless://${NODE_UUID}@${TCP_LINK_HOST}:${TCP_LINK_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}#VLESS-TCP-Reality"
+
+    echo "VLESS + TCP + Reality"
+    echo
+    echo "${TCP_LINK}"
+    echo
+
+fi
+
+# ======================================================
+# 18. XHTTP + TLS Link
+# ======================================================
+
+if [ "${PROTOCOL_TYPE}" = "xhttp-tls" ] || [ "${PROTOCOL_TYPE}" = "all" ]; then
+
+    XHTTP_LINK_PORT="${XHTTP_PUBLIC_PORT:-${XHTTP_PORT}}"
+    XHTTP_LINK_HOST="${VLESS_XHTTP_PUBLIC_HOST:-${PUBLIC_HOST}}"
+
+    XHTTP_LINK="vless://${NODE_UUID}@${XHTTP_LINK_HOST}:${XHTTP_LINK_PORT}?encryption=none&security=tls&type=xhttp&path=$(printf '%s' "${XHTTP_PATH}" | sed 's#/#%2F#g')&sni=${TLS_SNI}&fp=chrome&allowInsecure=1#VLESS-XHTTP-TLS"
+
+    echo "VLESS + XHTTP + TLS"
+    echo
+    echo "${XHTTP_LINK}"
+    echo
+
+fi
+
+# ======================================================
+# 19. gRPC + TLS Link
+# ======================================================
+
+if [ "${PROTOCOL_TYPE}" = "grpc-tls" ] || [ "${PROTOCOL_TYPE}" = "all" ]; then
+
+    GRPC_LINK_PORT="${GRPC_PUBLIC_PORT:-${GRPC_PORT}}"
+    GRPC_LINK_HOST="${VLESS_GRPC_PUBLIC_HOST:-${PUBLIC_HOST}}"
+
+    GRPC_LINK="vless://${NODE_UUID}@${GRPC_LINK_HOST}:${GRPC_LINK_PORT}?encryption=none&security=tls&type=grpc&serviceName=${GRPC_SERVICE_NAME}&sni=${TLS_SNI}&fp=chrome&alpn=h2&allowInsecure=1#VLESS-gRPC-TLS"
+
+    echo "VLESS + gRPC + TLS"
+    echo
+    echo "${GRPC_LINK}"
+    echo
+
+fi
+
+echo "======================================================"
+echo
+echo "Xray binary:"
+echo "${XRAY_BIN}"
+echo
+echo "Config:"
+echo "${CONFIG_FILE}"
+echo
+echo "Starting Xray..."
+echo
+
+# ======================================================
+# 20. Start
+# ======================================================
+
+exec "${XRAY_BIN}" run -c "${CONFIG_FILE}"
